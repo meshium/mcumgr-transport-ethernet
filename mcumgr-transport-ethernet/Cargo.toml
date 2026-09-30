@@ -1,0 +1,36 @@
+[package]
+name = "mcumgr-transport-ethernet"
+description = "Raw Ethernet (L2) transport for mcumgr-toolkit"
+categories = ["embedded", "network-programming"]
+readme = "../README.md"
+
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords.workspace = true
+
+[features]
+# Command line arguments and backend handler for `mcumgrctl::cli_main`
+cli = ["dep:mcumgrctl", "dep:clap"]
+
+[dependencies]
+mcumgr-toolkit.workspace = true
+thiserror.workspace = true
+miette.workspace = true
+log.workspace = true
+mcumgrctl = { workspace = true, optional = true }
+clap = { workspace = true, optional = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+socket2.workspace = true
+libc.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+clap.workspace = true
+
+[package.metadata.docs.rs]
+features = ["cli"]
+targets = ["x86_64-unknown-linux-gnu"]
