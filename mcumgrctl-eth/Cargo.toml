@@ -22,3 +22,6 @@ vendored-dbus = ["mcumgrctl/vendored-dbus"]
 mcumgrctl.workspace = true
 mcumgr-transport-ethernet = { workspace = true, features = ["cli"] }
 miette.workspace = true
+
+[build-dependencies]
+cargo_metadata = "0.23.1"

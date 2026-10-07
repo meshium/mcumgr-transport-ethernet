@@ -27,6 +27,25 @@
 //! # fn main() {}
 //! ```
 //!
+//! Devices on the local link can be found with [`EthernetTransport::discover`],
+//! which broadcasts an `os echo` probe and collects the answers:
+//!
+//! ```no_run
+//! # #[cfg(target_os = "linux")]
+//! # fn main() -> miette::Result<()> {
+//! use std::time::Duration;
+//!
+//! use mcumgr_transport_ethernet::EthernetTransport;
+//!
+//! for device in EthernetTransport::discover("eth0", Duration::from_secs(2))? {
+//!     println!("{} replied after {:?}", device.mac, device.rtt);
+//! }
+//! # Ok(())
+//! # }
+//! # #[cfg(not(target_os = "linux"))]
+//! # fn main() {}
+//! ```
+//!
 //! With the `cli` feature, [`cli`] integrates the transport into `mcumgrctl`.
 
 #![deny(missing_docs)]
@@ -41,10 +60,14 @@ use miette::Diagnostic;
 use thiserror::Error;
 
 #[cfg(target_os = "linux")]
-pub use linux::{EthernetError, EthernetTransport};
+pub use linux::{DiscoveredDevice, EthernetError, EthernetTransport};
 
 #[cfg(feature = "cli")]
 pub mod cli;
+
+/// The version of this crate, e.g. for a `-V` output of a binary that
+/// depends on it.
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// The EtherType used for SMP frames.
 ///
@@ -59,6 +82,13 @@ pub struct MacAddress(
     /// The six address bytes, in transmission order.
     pub [u8; ETH_ALEN],
 );
+
+impl MacAddress {
+    /// Whether this is the broadcast address, `ff:ff:ff:ff:ff:ff`.
+    pub fn is_broadcast(&self) -> bool {
+        self.0 == [0xff; ETH_ALEN]
+    }
+}
 
 /// The error returned when parsing a [`MacAddress`] fails.
 #[derive(Error, Debug, Diagnostic, Clone, PartialEq, Eq)]
@@ -125,6 +155,39 @@ mod linux {
 
     const ETH_DATA_LEN: usize = 1500;
 
+    /// The largest Ethernet frame read during discovery: a full payload, the
+    /// header, and a VLAN tag. Larger frames are truncated by the read, which
+    /// is harmless, as only the headers of a frame are inspected.
+    const ETH_MAX_FRAME: usize = ETH_HEADER_SIZE + ETH_DATA_LEN + 4;
+
+    const BROADCAST: MacAddress = MacAddress([0xff; ETH_ALEN]);
+
+    /// The SMP protocol version of `mcumgr-toolkit`, stored in the first
+    /// header byte above the operation code.
+    const SMP_VERSION: u8 = 0b01;
+
+    /// SMP operation codes of the discovery probe and its answer; `os echo`
+    /// is a read command, and reads are answered with `SMP_OP_READ_RSP`.
+    const SMP_OP_READ: u8 = 0;
+    const SMP_OP_READ_RSP: u8 = 1;
+
+    /// The `os echo` command id, in the OS group, whose group id is 0.
+    const OS_MGMT_ID_ECHO: u8 = 0;
+
+    const DISCOVERY_SEQ: u8 = 0;
+
+    /// The probe payload, a CBOR map: `{"d": "ping"}`.
+    const DISCOVERY_PAYLOAD: &[u8] = &[0xa1, 0x61, 0x64, 0x64, 0x70, 0x69, 0x6e, 0x67];
+
+    /// A device that answered an [`EthernetTransport::discover`] probe.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct DiscoveredDevice {
+        /// The MAC address the answer was sent from.
+        pub mac: MacAddress,
+        /// How long after the probe was sent the answer arrived.
+        pub rtt: Duration,
+    }
+
     /// Possible errors of [`EthernetTransport::new`].
     #[derive(Error, Debug, Diagnostic)]
     pub enum EthernetError {
@@ -176,12 +239,7 @@ mod linux {
             dst_mac: MacAddress,
             timeout: Duration,
         ) -> Result<Self, EthernetError> {
-            let (ifindex, src_mac) = read_interface(iface)?;
-
-            let protocol = Protocol::from(i32::from(ETHERTYPE_SMP.to_be()));
-            let socket = Socket::new(Domain::PACKET, Type::RAW, Some(protocol))?;
-            socket.bind(&packet_sockaddr(ifindex)?)?;
-            set_read_timeout(&socket, timeout)?;
+            let (socket, src_mac) = open_socket(iface, timeout)?;
 
             Ok(Self {
                 socket,
@@ -190,6 +248,74 @@ mod linux {
                 timeout,
                 send_buffer: Vec::new(),
             })
+        }
+
+        /// Scan `iface` for SMP devices.
+        ///
+        /// Broadcasts a single `os echo` probe and collects the answers for
+        /// `timeout`, returning one [`DiscoveredDevice`] per device, in the
+        /// order they replied.
+        ///
+        /// Firmware must accept frames addressed to the broadcast address to
+        /// be found. Firmware that answers with a broadcast source address,
+        /// in violation of this transport's reply convention, appears as a
+        /// single `ff:ff:ff:ff:ff:ff` entry.
+        ///
+        /// # Arguments
+        ///
+        /// * `iface` - The name of the local network interface, e.g. `"eth0"`.
+        /// * `timeout` - How long answers are collected.
+        pub fn discover(
+            iface: &str,
+            timeout: Duration,
+        ) -> Result<Vec<DiscoveredDevice>, EthernetError> {
+            let (mut socket, src_mac) = open_socket(iface, timeout)?;
+
+            let mut probe = Vec::new();
+            write_frame(
+                &mut probe,
+                &BROADCAST,
+                &src_mac,
+                &probe_header(),
+                DISCOVERY_PAYLOAD,
+            );
+            socket.send(&probe)?;
+            log::debug!("Sent discovery probe on '{iface}'");
+
+            let start = Instant::now();
+            let mut buffer = [0u8; ETH_MAX_FRAME];
+            let mut devices: Vec<DiscoveredDevice> = Vec::new();
+            loop {
+                let remaining = timeout.saturating_sub(start.elapsed());
+                if remaining.is_zero() {
+                    break;
+                }
+                // Each read would restart the socket timeout, so the
+                // deadline is enforced by shrinking it to the remaining time.
+                set_read_timeout(&socket, remaining)?;
+
+                let len = match socket.read(&mut buffer) {
+                    Ok(len) => len,
+                    // SO_RCVTIMEO reports an expired deadline as EAGAIN
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                    Err(e) if e.kind() == io::ErrorKind::TimedOut => break,
+                    Err(e) => return Err(e.into()),
+                };
+
+                if let Some((src, smp)) = parse_smp_frame(&buffer[..len])
+                    && src != src_mac
+                    && is_probe_response(&buffer[smp])
+                    && !devices.iter().any(|device| device.mac == src)
+                {
+                    let rtt = start.elapsed();
+                    log::debug!("Discovered SMP device {src} after {rtt:?}");
+                    devices.push(DiscoveredDevice { mac: src, rtt });
+                } else {
+                    log::debug!("Ignoring Ethernet frame during discovery ({len} bytes)");
+                }
+            }
+
+            Ok(devices)
         }
     }
 
@@ -263,6 +389,17 @@ mod linux {
         fn max_smp_frame_size(&self) -> usize {
             ETH_DATA_LEN
         }
+    }
+
+    fn open_socket(iface: &str, timeout: Duration) -> Result<(Socket, MacAddress), EthernetError> {
+        let (ifindex, src_mac) = read_interface(iface)?;
+
+        let protocol = Protocol::from(i32::from(ETHERTYPE_SMP.to_be()));
+        let socket = Socket::new(Domain::PACKET, Type::RAW, Some(protocol))?;
+        socket.bind(&packet_sockaddr(ifindex)?)?;
+        set_read_timeout(&socket, timeout)?;
+
+        Ok((socket, src_mac))
     }
 
     fn read_interface(iface: &str) -> io::Result<(i32, MacAddress)> {
@@ -362,25 +499,59 @@ mod linux {
     }
 
     /// Returns `None` for frames that were not sent by `expected_src`.
+    fn extract_smp_frame(frame: &[u8], expected_src: &MacAddress) -> Option<Range<usize>> {
+        let (src, range) = parse_smp_frame(frame)?;
+        (src == *expected_src).then_some(range)
+    }
+
+    /// Returns the sender and the SMP payload of any frame that carries our
+    /// EtherType, regardless of who sent it.
     ///
     /// Short frames get padded to the 60 byte Ethernet minimum, so the SMP
     /// frame is cut to the length stated in its header. Truncated frames are
     /// passed on as-is and rejected by the SMP header validation.
-    fn extract_smp_frame(frame: &[u8], expected_src: &MacAddress) -> Option<Range<usize>> {
+    fn parse_smp_frame(frame: &[u8]) -> Option<(MacAddress, Range<usize>)> {
         let (eth_header, payload) = frame.split_at_checked(ETH_HEADER_SIZE)?;
 
-        if eth_header[ETH_ALEN..2 * ETH_ALEN] != expected_src.0
-            || eth_header[2 * ETH_ALEN..] != ETHERTYPE_SMP.to_be_bytes()
-        {
+        if eth_header[2 * ETH_ALEN..] != ETHERTYPE_SMP.to_be_bytes() {
             return None;
         }
+        let src = MacAddress(*eth_header[ETH_ALEN..2 * ETH_ALEN].first_chunk::<ETH_ALEN>()?);
 
         // Bytes 2..4 of the SMP header are the body length, big endian
         let smp_header = payload.first_chunk::<SMP_HEADER_SIZE>()?;
         let data_length = u16::from_be_bytes([smp_header[2], smp_header[3]]);
         let smp_len = (SMP_HEADER_SIZE + usize::from(data_length)).min(payload.len());
 
-        Some(ETH_HEADER_SIZE..ETH_HEADER_SIZE + smp_len)
+        Some((src, ETH_HEADER_SIZE..ETH_HEADER_SIZE + smp_len))
+    }
+
+    /// The SMP header of the discovery probe: a version 1 read request for
+    /// `os echo` in the OS group.
+    fn probe_header() -> [u8; SMP_HEADER_SIZE] {
+        let [len_0, len_1] = u16::try_from(DISCOVERY_PAYLOAD.len())
+            .expect("the probe payload fits into an SMP frame")
+            .to_be_bytes();
+
+        [
+            (SMP_VERSION << 3) | SMP_OP_READ,
+            0,
+            len_0,
+            len_1,
+            0,
+            0,
+            DISCOVERY_SEQ,
+            OS_MGMT_ID_ECHO,
+        ]
+    }
+
+    /// Whether `smp` is an `os echo` response to the discovery probe.
+    fn is_probe_response(smp: &[u8]) -> bool {
+        let Some(header) = smp.first_chunk::<SMP_HEADER_SIZE>() else {
+            return false;
+        };
+
+        header[0] == (SMP_VERSION << 3) | SMP_OP_READ_RSP && header[6] == DISCOVERY_SEQ
     }
 
     #[cfg(test)]
@@ -456,6 +627,63 @@ mod linux {
             }
         }
 
+        fn frame_with_header(
+            src: &MacAddress,
+            header: [u8; SMP_HEADER_SIZE],
+            data: &[u8],
+        ) -> Vec<u8> {
+            let mut frame = Vec::new();
+            write_frame(&mut frame, &HOST, src, &header, data);
+            frame
+        }
+
+        fn echo_response_frame(src: &MacAddress, seq: u8) -> Vec<u8> {
+            let [len_0, len_1] = 2u16.to_be_bytes();
+            frame_with_header(
+                src,
+                [0x09, 0x00, len_0, len_1, 0x00, 0x00, seq, 0x00],
+                &[0xab, 0xcd],
+            )
+        }
+
+        #[test]
+        fn probe_header_layout() {
+            let [len_0, len_1] = (DISCOVERY_PAYLOAD.len() as u16).to_be_bytes();
+            assert_eq!(
+                probe_header(),
+                [0x08, 0x00, len_0, len_1, 0x00, 0x00, DISCOVERY_SEQ, 0x00]
+            );
+            assert_eq!(
+                DISCOVERY_PAYLOAD,
+                [0xa1, 0x61, 0x64, 0x64, 0x70, 0x69, 0x6e, 0x67]
+            );
+        }
+
+        #[test]
+        fn probe_response_recognised() {
+            let frame = echo_response_frame(&DEVICE, DISCOVERY_SEQ);
+            let (src, smp) = parse_smp_frame(&frame).unwrap();
+            assert_eq!(src, DEVICE);
+            assert!(is_probe_response(&frame[smp]));
+        }
+
+        #[test]
+        fn probe_ignores_wrong_sequence() {
+            let frame = echo_response_frame(&DEVICE, DISCOVERY_SEQ.wrapping_add(1));
+            let (_, smp) = parse_smp_frame(&frame).unwrap();
+            assert!(!is_probe_response(&frame[smp]));
+        }
+
+        #[test]
+        fn probe_ignores_requests_from_other_hosts() {
+            // A discovery probe from another host is a read request, not an
+            // answer, and must not be counted as a device.
+            let frame = frame_with_header(&HOST, probe_header(), DISCOVERY_PAYLOAD);
+            let (src, smp) = parse_smp_frame(&frame).unwrap();
+            assert_eq!(src, HOST);
+            assert!(!is_probe_response(&frame[smp]));
+        }
+
         #[test]
         fn invalid_interface_names() {
             for name in ["", ".", "..", "a/b", "../lo", "abcdefghijklmnop"] {
@@ -499,6 +727,12 @@ mod tests {
     fn display() {
         let mac = MacAddress([0x00, 0x1a, 0x2b, 0x3c, 0x4d, 0xff]);
         assert_eq!(mac.to_string(), "00:1a:2b:3c:4d:ff");
+    }
+
+    #[test]
+    fn broadcast_detection() {
+        assert!(MacAddress([0xff; ETH_ALEN]).is_broadcast());
+        assert!(!MacAddress([0xfe, 0xff, 0xff, 0xff, 0xff, 0xff]).is_broadcast());
     }
 
     proptest! {

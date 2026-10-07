@@ -28,6 +28,9 @@ fn main() -> miette::Result<()> {
 }
 ```
 
+Devices can be found without knowing their MAC address by broadcasting an
+`os echo` probe with `EthernetTransport::discover`.
+
 ## Command line
 
 The `mcumgrctl-eth` binary is `mcumgrctl` with this transport added:
@@ -38,6 +41,20 @@ $ sudo setcap cap_net_raw+ep target/release/mcumgrctl-eth
 $ target/release/mcumgrctl-eth --ethernet 02:00:00:00:00:01 --iface eth0
 Device alive and responsive.
 ```
+
+### Discovery
+
+Broadcast an `os echo` probe to find devices on the local link:
+
+```none
+$ target/release/mcumgrctl-eth --iface eth0 --discover
+Available SMP devices on 'eth0':
+ - 02:00:00:00:00:01 (replied after 1.234ms)
+```
+
+Answers are collected for `--timeout` milliseconds (default 1000); a command,
+if given, is not executed. To be found, a device must accept frames addressed
+to `ff:ff:ff:ff:ff:ff` and answer from its own MAC address.
 
 BLE is disabled by default, so no D-Bus library is needed. Enable it with
 `--features ble`.

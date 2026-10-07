@@ -10,6 +10,9 @@
 //!
 //! To combine it with other custom backends, flatten [`EthernetArgs`] into
 //! your own arguments and call [`init_backend`] from your handler.
+//!
+//! `--discover` makes [`init_backend`] scan the interface for devices and
+//! return [`BackendInitResult::Finished`] instead of a connected client.
 
 use mcumgrctl::{BackendInitResult, CommonArgs};
 
@@ -30,25 +33,57 @@ pub struct EthernetArgs {
     )]
     pub ethernet: Option<MacAddress>,
 
-    /// Network interface to use with --ethernet (e.g. "eth0")
-    #[arg(long, requires = "ethernet", value_name = "IFACE")]
+    /// Scan the interface for SMP devices, then exit
+    ///
+    /// Broadcasts an os echo probe and lists every device that answers,
+    /// together with the time its answer took. Answers are collected for
+    /// --timeout milliseconds; a command, if given, is not executed.
+    ///
+    /// Linux only. Requires --iface and the CAP_NET_RAW capability.
+    #[arg(long, verbatim_doc_comment, group = "transport", requires = "iface")]
+    pub discover: bool,
+
+    /// Network interface to use with --ethernet or --discover (e.g. "eth0")
+    #[arg(long, value_name = "IFACE")]
     pub iface: Option<String>,
 }
 
 /// Initializes the raw Ethernet backend, if `args` select it.
 ///
-/// Returns `Ok(None)` if `--ethernet` was not given.
+/// Returns `Ok(None)` if neither `--ethernet` nor `--discover` was given.
+/// With `--discover`, the interface is scanned, the results printed, and
+/// `Ok(Some(BackendInitResult::Finished))` returned.
 pub fn init_backend(
     args: &EthernetArgs,
     common: &CommonArgs,
 ) -> miette::Result<Option<BackendInitResult>> {
-    let (Some(mac), Some(iface)) = (args.ethernet, args.iface.as_deref()) else {
+    let Some(iface) = args.iface.as_deref() else {
         return Ok(None);
     };
 
     #[cfg(target_os = "linux")]
     {
         let timeout = std::time::Duration::from_millis(common.timeout);
+
+        if args.discover {
+            let devices = crate::EthernetTransport::discover(iface, timeout)?;
+            print_discovered(iface, &devices);
+            return Ok(Some(BackendInitResult::Finished));
+        }
+
+        let Some(mac) = args.ethernet else {
+            return Err(miette::miette!(
+                "--iface requires --ethernet or --discover"
+            ));
+        };
+
+        if mac.is_broadcast() {
+            return Err(miette::miette!(
+                "the broadcast address is not a valid --ethernet device, \
+                 use --discover to scan for devices"
+            ));
+        }
+
         let transport = crate::EthernetTransport::new(iface, mac, timeout)?;
         Ok(Some(BackendInitResult::Connected(
             mcumgr_toolkit::MCUmgrClient::new_from_transport(transport),
@@ -57,10 +92,23 @@ pub fn init_backend(
 
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = (mac, iface, common);
+        let _ = (iface, common);
         Err(miette::miette!(
             "The raw Ethernet transport is only supported on Linux"
         ))
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn print_discovered(iface: &str, devices: &[crate::DiscoveredDevice]) {
+    if devices.is_empty() {
+        println!("No SMP devices found on '{iface}'.");
+        println!("Try a longer --timeout if the device is slow to answer.");
+    } else {
+        println!("Available SMP devices on '{iface}':");
+        for device in devices {
+            println!(" - {} (replied after {:?})", device.mac, device.rtt);
+        }
     }
 }
 
@@ -96,9 +144,59 @@ mod tests {
     }
 
     #[test]
-    fn requires_both_arguments() {
+    fn ethernet_requires_iface() {
         assert!(TestCli::try_parse_from(["test", "--ethernet", "02:00:00:00:00:01"]).is_err());
-        assert!(TestCli::try_parse_from(["test", "--iface", "eth0"]).is_err());
+    }
+
+    #[test]
+    fn parse_discover() {
+        let cli = TestCli::try_parse_from(["test", "--discover", "--iface", "eth0"]).unwrap();
+        assert!(cli.ethernet.discover);
+        assert_eq!(cli.ethernet.ethernet, None);
+        assert_eq!(cli.ethernet.iface.as_deref(), Some("eth0"));
+    }
+
+    #[test]
+    fn discover_requires_iface() {
+        assert!(TestCli::try_parse_from(["test", "--discover"]).is_err());
+    }
+
+    #[test]
+    fn discover_conflicts_with_ethernet() {
+        assert!(TestCli::try_parse_from([
+            "test",
+            "--discover",
+            "--ethernet",
+            "02:00:00:00:00:01",
+            "--iface",
+            "eth0"
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn iface_requires_ethernet_or_discover() {
+        let cli = TestCli::try_parse_from(["test", "--iface", "eth0"]).unwrap();
+        assert!(init_backend(&cli.ethernet, &cli.common).is_err());
+    }
+
+    #[test]
+    fn broadcast_ethernet_rejected() {
+        let cli = TestCli::try_parse_from([
+            "test",
+            "--ethernet",
+            "ff:ff:ff:ff:ff:ff",
+            "--iface",
+            "eth0"
+        ])
+        .unwrap();
+        assert!(init_backend(&cli.ethernet, &cli.common).is_err());
+    }
+
+    #[test]
+    fn discover_fails_on_unknown_interface() {
+        let cli = TestCli::try_parse_from(["test", "--discover", "--iface", "missing0"]).unwrap();
+        assert!(init_backend(&cli.ethernet, &cli.common).is_err());
     }
 
     #[test]
